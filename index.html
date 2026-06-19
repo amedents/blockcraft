@@ -67,7 +67,7 @@
 
 <script>
 "use strict";
-var BUILD="20260619013308"; // stamped at publish; used by resume-reload below
+var BUILD="20260619020149"; // stamped at publish; used by resume-reload below
 
 /* ============================================================================
    BlockCraft — a first-person creative voxel sandbox, raw WebGL, one file.
@@ -274,16 +274,21 @@ function markDirty(cx,cz){ var c=chunks.get(ckey(cx,cz)); if(c) c.dirty=true; }
 
 /* ---- 6. MESHING (per-chunk, face-culled; opaque + blend buckets) --------- */
 // 6 faces: corner offsets (CCW), uv corners, and the hard directional shade.
+// Each face carries its 4 corner positions AND the matching tile-local UVs
+// (s = horizontal, t = vertical; t=0 is the tile TOP). The UVs are authored
+// per-face so that on SIDE faces the texture's vertical axis follows world-Y —
+// i.e. grass stays a cap across the top, not rotated 90deg onto an edge. With
+// UNPACK_FLIP_Y false, tileUV's v0=row-top(grass), v1=row-bottom(dirt), so t
+// maps straight through. (Was a single shared UVC table, which rotated sides.)
 var FACES=[
-  // dir, [4 corners xyz], shade
-  {d:[0, 1, 0], c:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]], s:1.00}, // top
-  {d:[0,-1, 0], c:[[0,0,1],[0,0,0],[1,0,0],[1,0,1]], s:0.50}, // bottom
-  {d:[0, 0,-1], c:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]], s:0.80}, // north -Z
-  {d:[0, 0, 1], c:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]], s:0.80}, // south +Z
-  {d:[-1,0, 0], c:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]], s:0.60}, // west -X
-  {d:[1, 0, 0], c:[[1,0,1],[1,0,0],[1,1,0],[1,1,1]], s:0.60}  // east +X
+  // dir, [4 corners xyz], [4 corner uv st], shade
+  {d:[0, 1, 0], c:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]], uv:[[0,0],[0,1],[1,1],[1,0]], s:1.00}, // top
+  {d:[0,-1, 0], c:[[0,0,1],[0,0,0],[1,0,0],[1,0,1]], uv:[[0,1],[0,0],[1,0],[1,1]], s:0.50}, // bottom
+  {d:[0, 0,-1], c:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]], uv:[[1,1],[0,1],[0,0],[1,0]], s:0.80}, // north -Z
+  {d:[0, 0, 1], c:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]], uv:[[0,1],[1,1],[1,0],[0,0]], s:0.80}, // south +Z
+  {d:[-1,0, 0], c:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]], uv:[[0,1],[1,1],[1,0],[0,0]], s:0.60}, // west -X
+  {d:[1, 0, 0], c:[[1,0,1],[1,0,0],[1,1,0],[1,1,1]], uv:[[1,1],[0,1],[0,0],[1,0]], s:0.60}  // east +X
 ];
-var UVC=[[0,1],[0,0],[1,0],[1,1]]; // corner -> tile-local uv
 function tileUV(t){ var col=t%ATLAS_COLS, row=(t/ATLAS_COLS)|0, e=0.001; return [col/ATLAS_COLS+e, row/ATLAS_COLS+e, (col+1)/ATLAS_COLS-e, (row+1)/ATLAS_COLS-e]; }
 function faceTile(id,fi){ var B=BLOCKS[id]; return fi===0?B.top:(fi===1?B.bot:B.side); }
 // neighbour-aware visibility: draw a face unless the neighbour fully occludes it.
@@ -302,9 +307,9 @@ function meshChunk(cx,cz){
       // two triangles (0,1,2)+(0,2,3); 6 floats/vertex: pos3, uv2, shade1
       var ci=[0,1,2,0,2,3];
       for(var k=0;k<6;k++){
-        var corner=F.c[ci[k]], uc=UVC[ci[k]];
+        var corner=F.c[ci[k]], st=F.uv[ci[k]];
         arr.push(wx+corner[0], wy+corner[1], wz+corner[2],
-                 lerp(uv[0],uv[2],uc[0]), lerp(uv[1],uv[3],uc[1]), sh);
+                 lerp(uv[0],uv[2],st[0]), lerp(uv[1],uv[3],st[1]), sh);
       }
     }
   }
@@ -340,7 +345,10 @@ function initGL(canvas){
   ["uProj","uView","uTex","uFog","uNear","uFar","uMode","uSolid"].forEach(function(n){ loc[n]=gl.getUniformLocation(prog,n); });
   // atlas upload — NEAREST + CLAMP, no mipmaps: the pixelated identity
   atlasTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,atlasTex);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false); // false: texel row 0 = canvas row 0 (painted).
+                            // true would mirror V onto the unpainted bottom rows -> alpha 0 -> every
+                            // face alpha-test-discarded -> whole world transparent. tileUV assumes
+                            // row 0 at top, so this MUST stay false. (deliberate — fixed 2026-06-19.)
   gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,buildAtlas());
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
@@ -506,7 +514,9 @@ document.addEventListener("keyup",function(e){
 });
 canvas.addEventListener("mousemove",function(e){
   if(!locked) return; var p=state.player, s=0.0024;
-  p.yaw+=e.movementX*s; p.pitch=clamp(p.pitch-e.movementY*s, -1.55, 1.55);
+  // yaw -= movementX: forward is -sin(yaw), so mouse-right (movementX>0) must DECREASE yaw to
+  // swing the view toward +X (screen-right). += turned the view left — the reported inversion.
+  p.yaw-=e.movementX*s; p.pitch=clamp(p.pitch-e.movementY*s, -1.55, 1.55);
 });
 canvas.addEventListener("mousedown",function(e){ if(!locked) return; if(e.button===0) breakBlock(); else if(e.button===2) placeBlock(); });
 canvas.addEventListener("contextmenu",function(e){ e.preventDefault(); });
@@ -531,7 +541,7 @@ if(isTouch){
   // look + tap/long-press on the rest of the screen
   var lookId=null, lx0=0,ly0=0, pressT=0, moved=false;
   canvas.addEventListener("touchstart",function(e){ if(locked){ var t=e.changedTouches[0]; lookId=t.identifier; lx0=t.clientX; ly0=t.clientY; pressT=performance.now(); moved=false; } },{passive:true});
-  canvas.addEventListener("touchmove",function(e){ if(lookId==null) return; for(var i=0;i<e.changedTouches.length;i++){ var t=e.changedTouches[i]; if(t.identifier===lookId){ var p=state.player,s=0.005; p.yaw+=(t.clientX-lx0)*s; p.pitch=clamp(p.pitch-(t.clientY-ly0)*s,-1.55,1.55); if(Math.hypot(t.clientX-lx0,t.clientY-ly0)>8) moved=true; lx0=t.clientX; ly0=t.clientY; } } },{passive:true});
+  canvas.addEventListener("touchmove",function(e){ if(lookId==null) return; for(var i=0;i<e.changedTouches.length;i++){ var t=e.changedTouches[i]; if(t.identifier===lookId){ var p=state.player,s=0.005; p.yaw-=(t.clientX-lx0)*s; p.pitch=clamp(p.pitch-(t.clientY-ly0)*s,-1.55,1.55); if(Math.hypot(t.clientX-lx0,t.clientY-ly0)>8) moved=true; lx0=t.clientX; ly0=t.clientY; } } },{passive:true});
   canvas.addEventListener("touchend",function(e){ if(lookId==null) return; var dt=performance.now()-pressT; if(!moved){ if(dt>350) placeBlock(); else breakBlock(); } lookId=null; });
   document.getElementById("bJump").addEventListener("touchstart",function(e){ keys.space=1; setTimeout(function(){keys.space=0;},150); e.preventDefault(); });
   document.getElementById("bFly").addEventListener("touchstart",function(e){ state.player.fly=!state.player.fly; state.player.vy=0; e.preventDefault(); });
